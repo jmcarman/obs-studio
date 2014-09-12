@@ -5,6 +5,7 @@
 #include <util/dstr.hpp>
 #include <util/util.hpp>
 #include <util/platform.h>
+#include <util/windows/WinHandle.hpp>
 #include "libdshowcapture/dshowcapture.hpp"
 #include "ffmpeg-decode.h"
 
@@ -77,10 +78,21 @@ void ffmpeg_log(void *bla, int level, const char *msg, va_list args)
 	av_log_default_callback(bla, level, msg, args);
 }
 
+enum class Action {
+	None,
+	Update,
+	Shutdown,
+	ConfigVideo,
+	ConfigAudio,
+	ConfigCrossbar1,
+	ConfigCrossbar2,
+};
+
+static DWORD CALLBACK DShowThread(LPVOID ptr);
+
 struct DShowInput {
 	obs_source_t source;
 	Device       device;
-	bool         comInitialized;
 	bool         deviceHasAudio;
 
 	struct ffmpeg_decode audio_decoder;
@@ -92,10 +104,23 @@ struct DShowInput {
 	obs_source_frame frame;
 	obs_source_audio audio;
 
+	WinHandle semaphore;
+	WinHandle thread;
+	CRITICAL_SECTION mutex;
+	vector<Action> actions;
+
+	inline void QueueAction(Action action)
+	{
+		EnterCriticalSection(&mutex);
+		actions.push_back(action);
+		LeaveCriticalSection(&mutex);
+
+		ReleaseSemaphore(semaphore, 1, nullptr);
+	}
+
 	inline DShowInput(obs_source_t source_)
 		: source         (source_),
-		  device         (InitGraph::False),
-		  comInitialized (false)
+		  device         (InitGraph::False)
 	{
 		memset(&audio_decoder, 0, sizeof(audio_decoder));
 		memset(&video_decoder, 0, sizeof(video_decoder));
@@ -104,13 +129,36 @@ struct DShowInput {
 
 		av_log_set_level(AV_LOG_WARNING);
 		av_log_set_callback(ffmpeg_log);
+
+		semaphore = CreateSemaphore(nullptr, 0, 0x7FFFFFFF, nullptr);
+		if (!semaphore)
+			throw "Failed to create semaphore";
+
+		thread = CreateThread(nullptr, 0, DShowThread, this, 0,
+				nullptr);
+		if (!thread)
+			throw "Failed to create thread";
+
+		InitializeCriticalSection(&mutex);
+
+		QueueAction(Action::Update);
 	}
 
 	inline ~DShowInput()
 	{
+		EnterCriticalSection(&mutex);
+		actions.resize(0);
+		actions.push_back(Action::Shutdown);
+		LeaveCriticalSection(&mutex);
+
+		ReleaseSemaphore(semaphore, 1, nullptr);
+
+		WaitForSingleObject(thread, INFINITE);
 
 		ffmpeg_decode_free(&audio_decoder);
 		ffmpeg_decode_free(&video_decoder);
+
+		DeleteCriticalSection(&mutex);
 	}
 
 	void OnEncodedVideoData(enum AVCodecID id,
@@ -128,7 +176,85 @@ struct DShowInput {
 	bool UpdateVideoConfig(obs_data_t settings);
 	bool UpdateAudioConfig(obs_data_t settings);
 	void Update(obs_data_t settings);
+
+	void DShowLoop();
 };
+
+static DWORD CALLBACK DShowThread(LPVOID ptr)
+{
+	DShowInput *dshowInput = (DShowInput*)ptr;
+
+	CoInitialize(nullptr);
+	dshowInput->DShowLoop();
+	CoUninitialize();
+	return 0;
+}
+
+static inline void ProcessMessages()
+{
+	MSG msg;
+	while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+}
+
+/* Always keep directshow in a single thread for a given device */
+void DShowInput::DShowLoop()
+{
+	while (true) {
+		DWORD ret = MsgWaitForMultipleObjects(1, &semaphore, false,
+				INFINITE, QS_ALLINPUT);
+		if (ret == (WAIT_OBJECT_0 + 1)) {
+			ProcessMessages();
+			continue;
+		} else if (ret != WAIT_OBJECT_0) {
+			break;
+		}
+
+		Action action = Action::None;
+
+		EnterCriticalSection(&mutex);
+		if (actions.size()) {
+			action = actions.front();
+			actions.erase(actions.begin());
+		}
+		LeaveCriticalSection(&mutex);
+
+		switch (action) {
+		case Action::Update:
+			{
+				obs_data_t settings;
+				settings = obs_source_get_settings(source);
+				Update(settings);
+				obs_data_release(settings);
+				break;
+			}
+
+		case Action::Shutdown:
+			device.ShutdownGraph();
+			return;
+
+		case Action::ConfigVideo:
+			device.OpenDialog(nullptr, DialogType::ConfigVideo);
+			break;
+
+		case Action::ConfigAudio:
+			device.OpenDialog(nullptr, DialogType::ConfigAudio);
+			break;
+
+		case Action::ConfigCrossbar1:
+			device.OpenDialog(nullptr, DialogType::ConfigCrossbar);
+			break;
+
+		case Action::ConfigCrossbar2:
+			device.OpenDialog(nullptr, DialogType::ConfigCrossbar2);
+			break;
+
+		case Action::None:;
+		}
+	}
+}
 
 #define FPS_HIGHEST   0LL
 #define FPS_MATCHING -1LL
@@ -639,11 +765,6 @@ bool DShowInput::UpdateAudioConfig(obs_data_t settings)
 
 void DShowInput::Update(obs_data_t settings)
 {
-	if (!comInitialized) {
-		CoInitialize(nullptr);
-		comInitialized = true;
-	}
-
 	if (!device.ResetGraph())
 		return;
 
@@ -684,10 +805,14 @@ static const char *GetDShowInputName(void)
 
 static void *CreateDShowInput(obs_data_t settings, obs_source_t source)
 {
-	DShowInput *dshow = new DShowInput(source);
+	DShowInput *dshow = nullptr;
 
-	/* causes a deferred update in the video thread */
-	obs_source_update(source, nullptr);
+	try {
+		dshow = new DShowInput(source);
+	} catch (const char *error) {
+		blog(LOG_ERROR, "Could not create device '%s': %s",
+				obs_source_get_name(source), error);
+	}
 
 	UNUSED_PARAMETER(settings);
 	return dshow;
@@ -700,7 +825,8 @@ static void DestroyDShowInput(void *data)
 
 static void UpdateDShowInput(void *data, obs_data_t settings)
 {
-	reinterpret_cast<DShowInput*>(data)->Update(settings);
+	UNUSED_PARAMETER(settings);
+	reinterpret_cast<DShowInput*>(data)->QueueAction(Action::Update);
 }
 
 static void GetDShowDefaults(obs_data_t settings)
@@ -958,7 +1084,7 @@ static bool VideoConfigClicked(obs_properties_t props, obs_property_t p,
 		void *data)
 {
 	DShowInput *input = reinterpret_cast<DShowInput*>(data);
-	input->device.OpenDialog(nullptr, DialogType::ConfigVideo);
+	input->QueueAction(Action::ConfigVideo);
 
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
@@ -969,7 +1095,7 @@ static bool VideoConfigClicked(obs_properties_t props, obs_property_t p,
 		void *data)
 {
 	DShowInput *input = reinterpret_cast<DShowInput*>(data);
-	input->device.OpenDialog(nullptr, DialogType::ConfigAudio);
+	input->QueueAction(Action::ConfigAudio);
 
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
@@ -980,7 +1106,7 @@ static bool CrossbarConfigClicked(obs_properties_t props, obs_property_t p,
 		void *data)
 {
 	DShowInput *input = reinterpret_cast<DShowInput*>(data);
-	input->device.OpenDialog(nullptr, DialogType::ConfigCrossbar);
+	input->QueueAction(Action::ConfigCrossbar1);
 
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
@@ -991,7 +1117,7 @@ static bool CrossbarConfigClicked(obs_properties_t props, obs_property_t p,
 		void *data)
 {
 	DShowInput *input = reinterpret_cast<DShowInput*>(data);
-	input->device.OpenDialog(nullptr, DialogType::ConfigCrossbar2);
+	input->QueueAction(Action::ConfigCrossbar2);
 
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
